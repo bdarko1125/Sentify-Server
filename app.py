@@ -1,157 +1,232 @@
-#TESTING
-
-from gevent import monkey
-
-monkey.patch_all()
-
+import os
+import datetime
+import time
+import random
+import requests
+import pandas as pd
+import numpy as np
+import finnhub
+import torch
+import yfinance as yf
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from flask_socketio import SocketIO, emit
-import yfinance as yf
-import pandas as pd
-from bs4 import BeautifulSoup
-from urllib.request import urlopen, Request
-import urllib.error
+from flask_socketio import SocketIO
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
-from transformers import pipeline
-import datetime
-import finnhub
-import threading
-import time
-import ssl
-import socket
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
 # Flask app setup
 app = Flask(__name__)
 CORS(app)
 socketio = SocketIO(app, cors_allowed_origins='*', async_mode='gevent')
 
+# API configurations
+FINNHUB_API_KEY = os.environ.get('FINNHUB_API_KEY', 'cqfi8mpr01qle0e3p83gcqfi8mpr01qle0e3p840')
+RAPIDAPI_KEY = os.environ.get('RAPIDAPI_KEY', '9601085229msh181f78af487f1dap109702jsn344b5d9a1892')
+NEWS_API_URL = "https://mboum-finance.p.rapidapi.com/v1/markets/news"
+RAPIDAPI_HOST = "mboum-finance.p.rapidapi.com"
+
 # Finnhub API client
-finnhub_client = finnhub.Client(api_key="cpr2japr01qifjjvdfegcpr2japr01qifjjvdff0")
+finnhub_client = finnhub.Client(api_key=FINNHUB_API_KEY)
 
-# Sentiment analysis pipelines
+# Headers for RapidAPI
+headers = {
+    "X-RapidAPI-Key": RAPIDAPI_KEY,
+    "X-RapidAPI-Host": RAPIDAPI_HOST
+}
+
+# Sentiment analysis setup
 vader_analyzer = SentimentIntensityAnalyzer()
-finvader_analyzer = pipeline("sentiment-analysis", model="ProsusAI/finbert")
-finbert_analyzer = pipeline("sentiment-analysis", model="ProsusAI/finbert")
-roberta_analyzer = pipeline("sentiment-analysis", model="cardiffnlp/twitter-roberta-base-sentiment")
+
+# Initialize tokenizers and models
+finbert_tokenizer = AutoTokenizer.from_pretrained("ProsusAI/finbert")
+finbert_model = AutoModelForSequenceClassification.from_pretrained("ProsusAI/finbert")
+roberta_tokenizer = AutoTokenizer.from_pretrained("cardiffnlp/twitter-roberta-base-sentiment")
+roberta_model = AutoModelForSequenceClassification.from_pretrained("cardiffnlp/twitter-roberta-base-sentiment")
 
 
-# Function to fetch news data with retry mechanism
-def fetch_news_data(ticker, retries=3, backoff_factor=0.3):
-    finwiz_url = 'https://finviz.com/quote.ashx?t='
-    url = finwiz_url + ticker
-    req = Request(url=url, headers={
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3'})
-
-    for attempt in range(retries):
-        try:
-            resp = urlopen(req, timeout=10)
-            html = BeautifulSoup(resp, features="lxml")
-            news_table = html.find(id='news-table')
-            return news_table
-        except (urllib.error.URLError, ssl.SSLError, socket.error) as e:
-            print(f"Error fetching data for {ticker} (attempt {attempt + 1}): {e}")
-            time.sleep(backoff_factor * (2 ** attempt))
-    return None
+def truncate_and_pad_text(text, tokenizer, max_length=512):
+    encoded = tokenizer.encode_plus(
+        text,
+        max_length=max_length,
+        padding='max_length',
+        truncation=True,
+        return_tensors='pt'
+    )
+    return encoded['input_ids'], encoded['attention_mask']
 
 
-# Function to fetch financial data using yfinance and Finnhub
-def fetch_finnhub_yfinance_data(ticker):
+def analyze_sentiment(text, model, tokenizer):
     try:
-        # Fetch data using Finnhub
-        quote = finnhub_client.quote(ticker)
-        company = finnhub_client.company_profile2(symbol=ticker)
-        metrics = finnhub_client.company_basic_financials(ticker, 'all')['metric']
+        input_ids, attention_mask = truncate_and_pad_text(text, tokenizer)
+        with torch.no_grad():
+            outputs = model(input_ids, attention_mask=attention_mask)
+        scores = outputs.logits.softmax(dim=1)
+        return scores[0][1].item() - scores[0][0].item()  # Positive score minus negative score
+    except Exception as e:
+        print(f"Error in sentiment analysis: {e}")
+        return 0  # Return neutral sentiment in case of error
 
-        price = quote.get("c", 0)
-        change = quote.get("d", 0)
-        percent_change = quote.get("dp", 0)
-        name = company.get("name", "N/A")
-        country = company.get("country", "N/A")
 
-        # Fetch data using yfinance
+def analyze_sentiment_finbert(text, model, tokenizer):
+    try:
+        input_ids, attention_mask = truncate_and_pad_text(text, tokenizer)
+        with torch.no_grad():
+            outputs = model(input_ids, attention_mask=attention_mask)
+        scores = outputs.logits.softmax(dim=1)
+        # FinBERT order: [negative, neutral, positive]
+        return scores[0][2].item() - scores[0][0].item()  # Positive score minus negative score
+    except Exception as e:
+        print(f"Error in FinBERT sentiment analysis: {e}")
+        return 0  # Return neutral sentiment in case of error
+
+
+def fetch_yahoo_data(ticker):
+    try:
         stock = yf.Ticker(ticker)
-        market_cap = stock.info.get("marketCap", 0)
-        pe_ratio = stock.info.get("trailingPE", 0)
-        avg_volume = stock.info.get("averageVolume", 0)
-        volume = quote.get("v", 0)
-        relative_volume = volume / avg_volume if avg_volume else 0
+        info = stock.info
+        history = stock.history(period="1mo")
+
+        current_volume = info.get('volume', 0)
+        avg_volume = info.get('averageVolume', 0)
+        relative_volume = current_volume / avg_volume if avg_volume else 0
 
         return {
-            "name": name,
-            "price": price,
-            "change": change,
-            "percent_change": percent_change,
-            "market_cap": market_cap,
-            "pe_ratio": pe_ratio,
+            "volume": current_volume,
             "avg_volume": avg_volume,
-            "relative_volume": relative_volume,
-            "volume": volume,
-            "country": country,
+            "relative_volume": relative_volume
         }
     except Exception as e:
-        print(f"Error fetching data for {ticker}: {e}")
+        print(f"Error fetching Yahoo data for {ticker}: {e}")
         return {
-            "name": "N/A",
-            "price": 0,
-            "change": 0,
-            "percent_change": 0,
-            "market_cap": 0,
-            "pe_ratio": 0,
-            "avg_volume": 0,
-            "relative_volume": 0,
             "volume": 0,
-            "country": "N/A",
+            "avg_volume": 0,
+            "relative_volume": 0
         }
 
 
-# Convert sentiment labels to numeric scores for mode calculation
-def sentiment_label_to_numeric(label):
-    return {
-        'positive': 1,
-        'neutral': 0,
-        'negative': -1
-    }.get(label, 0)
+def fetch_finnhub_data(ticker):
+    try:
+        quote = finnhub_client.quote(ticker)
+        profile = finnhub_client.company_profile2(symbol=ticker)
+        metrics = finnhub_client.company_basic_financials(ticker, 'all')['metric']
+
+        yahoo_data = fetch_yahoo_data(ticker)
+
+        return {
+            "name": profile.get("name", "N/A"),
+            "price": quote.get("c", 0),
+            "change": quote.get("d", 0),
+            "percent_change": quote.get("dp", 0),
+            "market_cap": metrics.get("marketCapitalization", 0),
+            "pe_ratio": metrics.get("peBasicExclExtraTTM", 0),
+            "avg_volume": yahoo_data["avg_volume"],
+            "volume": yahoo_data["volume"],
+            "relative_volume": yahoo_data["relative_volume"],
+            "country": profile.get("country", "N/A"),
+        }
+    except Exception as e:
+        print(f"Error fetching data for {ticker} from Finnhub: {e}")
+        return {
+            "name": "N/A", "price": 0, "change": 0, "percent_change": 0,
+            "market_cap": 0, "pe_ratio": 0, "avg_volume": 0,
+            "relative_volume": 0, "volume": 0, "country": "N/A",
+        }
 
 
-# Function to process news data
-def process_news_data(news_tables):
-    parsed_news = []
-    for ticker, news_table in news_tables.items():
-        for x in news_table.findAll('tr'):
-            if x.a:
-                text = x.a.get_text()
-                date_scrape = x.td.text.split()
+def fetch_news_data(ticker, start_date, end_date):
+    querystring = {"symbol": ticker}
+    max_retries = 3
+    retry_delay = 5  # seconds
 
-                if len(date_scrape) == 1:
-                    time = date_scrape[0]
-                    date = datetime.datetime.now().date()
+    for attempt in range(max_retries):
+        try:
+            response = requests.get(NEWS_API_URL, headers=headers, params=querystring)
+            response.raise_for_status()
+            data = response.json()
+
+            if 'body' not in data or not isinstance(data['body'], list):
+                print(f"Unexpected response format for {ticker}: {data}")
+                return []
+
+            news_data = data['body']
+
+            filtered_news = []
+            for news in news_data:
+                if isinstance(news, dict) and 'pubDate' in news:
+                    news_date = datetime.datetime.strptime(news['pubDate'], '%a, %d %b %Y %H:%M:%S %z').date()
+                    if start_date <= news_date <= end_date:
+                        filtered_news.append(news)
                 else:
-                    date = date_scrape[0]
-                    time = date_scrape[1]
+                    print(f"Unexpected news item format for {ticker}: {news}")
 
-                parsed_news.append([ticker, date, time, text])
+            return filtered_news
 
-    columns = ['Ticker', 'Date', 'Time', 'Headline']
-    news = pd.DataFrame(parsed_news, columns=columns)
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 429:  # Too Many Requests
+                if attempt < max_retries - 1:
+                    wait_time = retry_delay * (2 ** attempt) + random.uniform(0, 1)
+                    time.sleep(wait_time)
+                    continue
+            print(f"Error fetching news data for {ticker}: {e}")
+            return []
+        except Exception as e:
+            print(f"Error fetching news data for {ticker}: {e}")
+            return []
 
-    # Specify the format of the date
-    news['Date'] = pd.to_datetime(news['Date'], format='%b-%d-%y', errors='coerce').dt.date
+    print(f"Failed to fetch news data for {ticker} after {max_retries} attempts")
+    return []
 
-    # Analyze sentiments
-    news['vader_score'] = news['Headline'].apply(lambda x: vader_analyzer.polarity_scores(x)['compound'])
-    news['vader'] = news['vader_score'].apply(
-        lambda x: 'positive' if x > 0.05 else ('negative' if x < -0.05 else 'neutral'))
 
-    news['finvader_score'] = news['Headline'].apply(lambda x: finvader_analyzer(x)[0]['label'])
-    news['finbert_score'] = news['Headline'].apply(lambda x: finbert_analyzer(x)[0]['label'])
-    news['roberta_score'] = news['Headline'].apply(lambda x: roberta_analyzer(x)[0]['label'])
+def process_news_data(tickers, start_date, end_date):
+    all_news = []
 
-    # Map RoBERTa labels to positive, neutral, negative
-    news['roberta'] = news['roberta_score'].map(
-        lambda x: 'positive' if x == 'LABEL_2' else ('negative' if x == 'LABEL_0' else 'neutral'))
+    for ticker in tickers:
+        news_data = fetch_news_data(ticker, start_date, end_date)
 
-    return news
+        for news in news_data:
+            headline = news.get('title', '')
+            body = news.get('description', '')
+            link = news.get('link', '')
+            news_date = datetime.datetime.strptime(news.get('pubDate', ''), '%a, %d %b %Y %H:%M:%S %z')
+
+            vader_score = vader_analyzer.polarity_scores(body)['compound']
+            finbert_score = analyze_sentiment_finbert(body, finbert_model, finbert_tokenizer)
+            roberta_score = analyze_sentiment(body, roberta_model, roberta_tokenizer)
+
+            all_news.append({
+                'Ticker': ticker,
+                'Date': news_date.strftime('%Y-%m-%d'),
+                'Time': news_date.strftime('%H:%M:%S'),
+                'Headline': headline,
+                'Link': link,
+                'Body': body,
+                'vader_score': vader_score,
+                'vader': 'positive' if vader_score > 0.05 else ('negative' if vader_score < -0.05 else 'neutral'),
+                'finbert_score': finbert_score,
+                'roberta_score': roberta_score,
+                'ensemble_score': (vader_score + finbert_score + roberta_score) / 3
+            })
+
+        time.sleep(1)  # Add delay between processing each ticker
+
+    if not all_news:
+        return pd.DataFrame([{
+            'Ticker': 'N/A', 'Date': 'N/A', 'Time': 'N/A', 'Headline': 'No News',
+            'Link': 'N/A', 'Body': 'N/A', 'vader_score': 0, 'vader': 'neutral',
+            'finbert_score': 0, 'roberta_score': 0, 'ensemble_score': 0
+        }])
+
+    return pd.DataFrame(all_news)
+
+
+def convert_int64_to_int(obj):
+    if isinstance(obj, np.int64):
+        return int(obj)
+    elif isinstance(obj, dict):
+        return {k: convert_int64_to_int(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_int64_to_int(i) for i in obj]
+    return obj
 
 
 @app.route('/upload', methods=['POST'])
@@ -160,68 +235,73 @@ def upload_file():
         return jsonify({'error': 'No file provided'}), 400
 
     file = request.files['file']
+    start_date = request.form.get('startDate')
+    end_date = request.form.get('endDate')
+
     if file.filename == '':
         return jsonify({'error': 'No selected file'}), 400
 
-    if file:
+    if file and start_date and end_date:
+        start_date = datetime.datetime.strptime(start_date, '%Y-%m-%d').date()
+        end_date = datetime.datetime.strptime(end_date, '%Y-%m-%d').date()
+
         df = pd.read_csv(file)
         tickers = df['Ticker'].tolist()
         results = []
 
+        news = process_news_data(tickers, start_date, end_date)
+
         for ticker in tickers:
             try:
-                stock_info = fetch_finnhub_yfinance_data(ticker)
-                news_table = fetch_news_data(ticker)
-                if not news_table:
-                    continue
+                stock_info = fetch_finnhub_data(ticker)
+                ticker_news = news[news['Ticker'] == ticker]
 
-                news_tables = {ticker: news_table}
-                news = process_news_data(news_tables)
+                vader_score = round(ticker_news['vader_score'].mean(), 2) if not ticker_news.empty else 0
+                finbert_score = round(ticker_news['finbert_score'].mean(), 2) if not ticker_news.empty else 0
+                roberta_score = round(ticker_news['roberta_score'].mean(), 2) if not ticker_news.empty else 0
+                ensemble_score = round(ticker_news['ensemble_score'].mean(), 2) if not ticker_news.empty else 0
 
-                # Calculate the mean for vader_score
-                vader_score = news['vader_score'].mean() if not news['vader_score'].empty else 0
-
-                # Convert sentiment labels to numeric for mode calculation
-                news['finvader_numeric'] = news['finvader_score'].apply(sentiment_label_to_numeric)
-                news['finbert_numeric'] = news['finbert_score'].apply(sentiment_label_to_numeric)
-                news['roberta_numeric'] = news['roberta'].apply(sentiment_label_to_numeric)
-
-                finvader_score = news['finvader_numeric'].mode()[0] if not news['finvader_numeric'].empty else 0
-                finbert_score = news['finbert_numeric'].mode()[0] if not news['finbert_numeric'].empty else 0
-                roberta_score = news['roberta_numeric'].mode()[0] if not news['roberta_numeric'].empty else 0
-
-                # Convert all numerical values to float or regular int
-                result = {
+                results.append({
                     'No': len(results) + 1,
                     'Ticker': ticker,
                     'Company': stock_info['name'],
                     'Country': stock_info['country'],
-                    'Market Cap': float(stock_info['market_cap']) if stock_info['market_cap'] else 'N/A',
-                    'P/E': float(stock_info['pe_ratio']) if stock_info['pe_ratio'] else 'N/A',
-                    'Average Volume': float(stock_info['avg_volume']) if stock_info['avg_volume'] else 'N/A',
-                    'Relative Volume': float(stock_info['relative_volume']) if stock_info['relative_volume'] else 'N/A',
-                    'Volume': float(stock_info['volume']) if stock_info['volume'] else 'N/A',
-                    'Price': float(stock_info['price']) if stock_info['price'] else 'N/A',
-                    'Change %': float(stock_info['percent_change']) if stock_info['percent_change'] else 'N/A',
-                    'Vader Score': float(vader_score),
-                    'FinVader Score': float(finvader_score),
-                    'FinBERT Score': float(finbert_score),
-                    'RoBERTa Score': float(roberta_score)
-                }
-
-                for key, value in result.items():
-                    if isinstance(value, pd._libs.tslibs.nattype.NaTType):
-                        result[key] = 'N/A'
-                    elif isinstance(value, pd._libs.tslibs.timestamps.Timestamp):
-                        result[key] = str(value)
-                    elif isinstance(value, (int, float)):
-                        result[key] = float(value) if not pd.isnull(value) else 'N/A'
-
-                results.append(result)
+                    'Market Cap': round(float(stock_info['market_cap'] or 0), 2),
+                    'P/E': round(float(stock_info['pe_ratio'] or 0), 2),
+                    'Average Volume': round(float(stock_info['avg_volume'] or 0), 2),
+                    'Relative Volume': round(float(stock_info['relative_volume'] or 0), 2),
+                    'Volume': round(float(stock_info['volume'] or 0), 2),
+                    'Price': round(float(stock_info['price'] or 0), 2),
+                    'Change %': round(float(stock_info['percent_change'] or 0), 2),
+                    'Vader Score': vader_score,
+                    'FinBERT Score': finbert_score,
+                    'RoBERTa Score': roberta_score,
+                    'Ensemble Score': ensemble_score
+                })
             except Exception as e:
                 print(f"Error processing ticker {ticker}: {e}")
+                results.append({
+                    'No': len(results) + 1,
+                    'Ticker': ticker,
+                    'Company': 'Error',
+                    'Country': 'N/A',
+                    'Market Cap': 0,
+                    'P/E': 0,
+                    'Average Volume': 0,
+                    'Relative Volume': 0,
+                    'Volume': 0,
+                    'Price': 0,
+                    'Change %': 0,
+                    'Vader Score': 0,
+                    'FinBERT Score': 0,
+                    'RoBERTa Score': 0,
+                    'Ensemble Score': 0
+                })
 
-        return jsonify(results)
+        results = convert_int64_to_int(results)
+        all_news = convert_int64_to_int(news.to_dict(orient='records'))
+
+        return jsonify({'results': results, 'news': all_news})
 
 
 @socketio.on('connect')
