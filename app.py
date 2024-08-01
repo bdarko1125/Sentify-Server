@@ -19,6 +19,7 @@ from requests.exceptions import RequestException
 from unsplash.api import Api
 from unsplash.auth import Auth
 from dotenv import load_dotenv
+
 load_dotenv()
 
 # Initialize Flask app
