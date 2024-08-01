@@ -19,7 +19,6 @@ from requests.exceptions import RequestException
 from unsplash.api import Api
 from unsplash.auth import Auth
 from dotenv import load_dotenv
-
 load_dotenv()
 
 # Initialize Flask app
@@ -438,4 +437,6 @@ def test_disconnect():
     print("Client disconnected")
 
 if __name__ == '__main__':
-    socketio.run(app, debug=True, allow_unsafe_werkzeug=True)
+    socketio.run(app, debug=True)
+
+
