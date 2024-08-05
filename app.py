@@ -52,7 +52,7 @@ finbert_model = AutoModelForSequenceClassification.from_pretrained("ProsusAI/fin
 roberta_tokenizer = AutoTokenizer.from_pretrained("cardiffnlp/twitter-roberta-base-sentiment")
 roberta_model = AutoModelForSequenceClassification.from_pretrained("cardiffnlp/twitter-roberta-base-sentiment")
 
-def truncate_and_pad_text(text, tokenizer, max_length=512):
+def truncate_and_pad_text(text, tokenizer, max_length=1000): # from 512 to 1000
     """Encode text with padding and truncation for model input."""
     encoded = tokenizer.encode_plus(
         text,
@@ -182,7 +182,7 @@ def process_news_data(tickers, start_date, end_date):
             headline = news.get('title', '')
             body = news.get('description', '')
             link = news.get('link', '')
-            news_date = datetime.datetime.strptime(news.get('pubDate', ''), '%a, %d %b %Y %H:%M:%S %z')
+            news_date = datetime.datetime.strptime(news.get('pubDate', ''), '%a, %d %b %Y %H:%M:%S %z').date()
             vader_score = vader_analyzer.polarity_scores(body)['compound']
             finbert_score = analyze_sentiment_finbert(body, finbert_model, finbert_tokenizer)
             roberta_score = analyze_sentiment(body, roberta_model, roberta_tokenizer)
@@ -372,8 +372,8 @@ def upload_file():
     if file.filename == '':
         return jsonify({'error': 'No selected file'}), 400
     if file and start_date and end_date:
-        start_date = datetime.datetime.strptime(start_date, '%Y-%m-%d').date()
-        end_date = datetime.datetime.strptime(end_date, '%Y-%m-%d').date()
+        start_date = datetime.datetime.strptime(start_date, '%m-%d-%Y').date() #changed date format from Y-m-d
+        end_date = datetime.datetime.strptime(end_date, '%m-%d-%Y').date()
         df = pd.read_csv(file)
         tickers = df['Ticker'].tolist()
         results = []
